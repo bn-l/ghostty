@@ -1240,12 +1240,14 @@ fn selectionScrollTick(self: *Surface) !void {
     }
 
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
 
     // We need our locked state for the remainder
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    self.renderer_state.resetSmoothScrollOffset();
+    const pos_vp = self.posToViewport(pos.x, pos.y);
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
         .viewport = pos_vp,
@@ -2254,6 +2256,7 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
     self.renderer_state.mutex.lock();
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
+    const smooth_scroll_offset = self.renderer_state.smooth_scroll_offset;
     self.renderer_state.mutex.unlock();
 
     // TODO: need to handle when scrolling and the cursor is not
@@ -2281,6 +2284,9 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
 
         // We want the bottom
         y += @floatFromInt(self.size.cell.height);
+
+        // Keep the IME anchor aligned with fractionally shifted cell content.
+        y += @as(f64, @floatCast(smooth_scroll_offset));
 
         // And scale it
         y /= content_scale.y;
@@ -2709,6 +2715,7 @@ pub fn applyPendingResizeIfNeeded(self: *Surface) void {
 
     if (t.cols == grid_size.columns and t.rows == grid_size.rows) return;
 
+    self.renderer_state.resetSmoothScrollOffset();
     t.resize(
         self.alloc,
         grid_size.columns,
@@ -3048,7 +3055,10 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) {
+            self.renderer_state.resetSmoothScrollOffset();
+            self.io.terminal.scrollViewport(.bottom);
+        }
 
         try self.queueRender();
     }
@@ -3665,6 +3675,51 @@ const ScrollAmount = struct {
     }
 };
 
+/// Scroll to a fractional row offset from the top of scrollback. The terminal
+/// model remains row based and the renderer draws the fractional remainder.
+pub fn scrollToOffset(self: *Surface, offset: f64) !void {
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const scrollbar = t.screens.active.pages.scrollbar();
+        const max_offset: usize = if (scrollbar.total > scrollbar.len)
+            scrollbar.total - scrollbar.len
+        else
+            0;
+        const finite_offset = if (std.math.isFinite(offset)) offset else 0;
+        const clamped_offset = std.math.clamp(
+            finite_offset,
+            0,
+            @as(f64, @floatFromInt(max_offset)),
+        );
+        const integer_offset = @floor(clamped_offset);
+        const row_offset: usize = @intFromFloat(integer_offset);
+        const fractional_offset = clamped_offset - integer_offset;
+
+        t.screens.active.scroll(.{ .row = row_offset });
+        self.mouse.pending_scroll_x = 0;
+        self.mouse.pending_scroll_y = 0;
+
+        const cell_height: f64 = @floatFromInt(self.size.cell.height);
+        if (fractional_offset > 0 and cell_height > 0) {
+            self.renderer_state.smooth_scroll_offset = @floatCast(
+                -fractional_offset * cell_height,
+            );
+            self.renderer_state.smooth_scroll_overscan = 1;
+            t.screens.active.pages.setViewportOverscanRows(1);
+        } else {
+            self.renderer_state.resetSmoothScrollOffset();
+        }
+    }
+
+    try self.queueRender();
+}
+
 /// Mouse scroll event. Negative is down, left. Positive is up, right.
 ///
 /// "Natural scrolling" is a macOS term for inverting the scroll direction.
@@ -3839,6 +3894,7 @@ pub fn scrollCallback(
         }
 
         if (y.delta != 0) {
+            self.renderer_state.resetSmoothScrollOffset();
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
@@ -4895,9 +4951,6 @@ pub fn cursorPosCallback(
     // Update our modifiers if they changed
     if (mods) |v| self.modsChanged(v);
 
-    // The mouse position in the viewport
-    const pos_vp = self.posToViewport(pos.x, pos.y);
-
     // We always reset the over link status because it will be reprocessed
     // below. But we need the old value to know if we need to undo mouse
     // shape changes.
@@ -4907,6 +4960,9 @@ pub fn cursorPosCallback(
     // We are reading/writing state for the remainder
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+
+    // The mouse position in the fractionally rendered viewport.
+    const pos_vp = self.posToViewport(pos.x, pos.y);
 
     // Update our mouse state. We set this to null initially because we only
     // want to set it when we're not selecting or doing any other mouse
@@ -5075,9 +5131,19 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
     self.queueIo(.{ .color_scheme_report = .{ .force = false } }, .unlocked);
 }
 
-pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
+fn smoothScrollInputY(ypos: f64, smooth_scroll_offset: f32) f64 {
+    return ypos - @as(f64, @floatCast(smooth_scroll_offset));
+}
+
+/// Convert a surface point into the rendered terminal viewport. The renderer
+/// state mutex must be held so the inverse fractional transform is coherent
+/// with the terminal model used by the caller.
+pub fn posToViewport(self: *const Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
     // Get our grid cell
-    const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
+    const coord: rendererpkg.Coordinate = .{ .surface = .{
+        .x = xpos,
+        .y = smoothScrollInputY(ypos, self.renderer_state.smooth_scroll_offset),
+    } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
 }
@@ -5086,6 +5152,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
+    self.renderer_state.resetSmoothScrollOffset();
     self.io.terminal.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
@@ -5547,6 +5614,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
                 const t: *terminal.Terminal = self.renderer_state.terminal;
+                self.renderer_state.resetSmoothScrollOffset();
                 t.screens.active.scroll(.{ .row = n });
             }
 
@@ -5559,6 +5627,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer self.renderer_state.mutex.unlock();
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
+                self.renderer_state.resetSmoothScrollOffset();
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
             }
 
@@ -6327,6 +6396,7 @@ fn completeTextInput(
     }
 
     if (self.config.scroll_to_bottom.keystroke) {
+        self.renderer_state.resetSmoothScrollOffset();
         self.io.terminal.scrollViewport(.bottom);
     }
 
@@ -6446,6 +6516,12 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: smooth scroll input applies inverse renderer offset" {
+    try std.testing.expectEqual(@as(f64, 15), smoothScrollInputY(10, -5));
+    try std.testing.expectEqual(@as(f64, 10), smoothScrollInputY(10, 0));
+    try std.testing.expectEqual(@as(f64, 5), smoothScrollInputY(10, 5));
 }
 
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {

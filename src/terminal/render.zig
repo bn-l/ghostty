@@ -82,13 +82,17 @@ pub const RenderState = struct {
     rows: size.CellCountInt,
     cols: size.CellCountInt,
 
+    /// Rows rendered below the integer viewport for fractional scrolling.
+    overscan_rows: u8,
+
     /// The color state for the terminal.
     colors: Colors,
 
     /// Cursor state within the viewport.
     cursor: Cursor,
 
-    /// The rows (y=0 is top) of the viewport. Guaranteed to be `rows` length.
+    /// The rows (y=0 is top) of the viewport and any requested overscan.
+    /// Guaranteed to be `rows + overscan_rows` length.
     ///
     /// This is a MultiArrayList because only the update cares about
     /// the allocators. Callers care about all the other properties, and
@@ -128,6 +132,7 @@ pub const RenderState = struct {
     pub const empty: RenderState = .{
         .rows = 0,
         .cols = 0,
+        .overscan_rows = 0,
         .colors = .{
             .background = .{ .r = 0, .g = 0, .b = 0 },
             .foreground = .{ .r = 0xff, .g = 0xff, .b = 0xff },
@@ -352,6 +357,16 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
+        return self.beginUpdateWithOverscan(alloc, t, 0);
+    }
+
+    /// Begin an update and include rows immediately below the viewport.
+    pub fn beginUpdateWithOverscan(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        overscan_rows: u8,
+    ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
         const redraw = redraw: {
@@ -377,7 +392,8 @@ pub const RenderState = struct {
 
             // If our dimensions changed, we do a full rebuild.
             if (self.rows != s.pages.rows or
-                self.cols != s.pages.cols)
+                self.cols != s.pages.cols or
+                self.overscan_rows != overscan_rows)
             {
                 break :redraw true;
             }
@@ -393,6 +409,7 @@ pub const RenderState = struct {
         // Always set our cheap fields, its more expensive to compare
         self.rows = s.pages.rows;
         self.cols = s.pages.cols;
+        self.overscan_rows = overscan_rows;
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
@@ -436,19 +453,20 @@ pub const RenderState = struct {
         // Ensure our row length is exactly our height, freeing or allocating
         // data as necessary. In most cases we'll have a perfectly matching
         // size.
-        if (self.row_data.len != self.rows) {
+        const render_rows: usize = @as(usize, self.rows) + @as(usize, overscan_rows);
+        if (self.row_data.len != render_rows) {
             @branchHint(.unlikely);
 
-            if (self.row_data.len < self.rows) {
+            if (self.row_data.len < render_rows) {
                 // Resize our rows to the desired length, marking any added
                 // values undefined.
                 const old_len = self.row_data.len;
-                try self.row_data.resize(alloc, self.rows);
+                try self.row_data.resize(alloc, render_rows);
 
                 // Initialize all our values. Its faster to use slice() + set()
                 // because appendAssumeCapacity does this multiple times.
                 var row_data = self.row_data.slice();
-                for (old_len..self.rows) |y| {
+                for (old_len..render_rows) |y| {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
@@ -462,14 +480,14 @@ pub const RenderState = struct {
             } else {
                 const row_data = self.row_data.slice();
                 for (
-                    row_data.items(.arena)[self.rows..],
-                    row_data.items(.cells)[self.rows..],
+                    row_data.items(.arena)[render_rows..],
+                    row_data.items(.cells)[render_rows..],
                 ) |state, *cell| {
                     var arena: ArenaAllocator = state.promote(alloc);
                     arena.deinit();
                     cell.deinit(alloc);
                 }
-                self.row_data.shrinkRetainingCapacity(self.rows);
+                self.row_data.shrinkRetainingCapacity(render_rows);
             }
         }
 
@@ -508,7 +526,7 @@ pub const RenderState = struct {
         var y: usize = 0;
         var any_dirty: bool = false;
         var page_it = viewport_pin.pageIterator(.right_down, null);
-        while (y < self.rows) {
+        while (y < render_rows) {
             const chunk = page_it.next() orelse break;
             const node = chunk.node;
             const p: *page.Page = node.page();
@@ -518,7 +536,7 @@ pub const RenderState = struct {
             // exactly `rows` tall) so we clamp.
             const take: usize = @min(
                 @as(usize, chunk.end - chunk.start),
-                self.rows - y,
+                render_rows - y,
             );
 
             // Find our cursor if we haven't found it yet. We do this even
@@ -610,7 +628,7 @@ pub const RenderState = struct {
 
             y += take;
         }
-        assert(y == self.rows);
+        assert(y == render_rows);
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -1241,6 +1259,37 @@ test "basic text" {
     try testing.expectEqual('C', cells[0].get(2).raw.codepoint());
     try testing.expectEqual('D', cells[0].get(3).raw.codepoint());
     try testing.expectEqual(0, cells[0].get(4).raw.codepoint());
+}
+
+test "fractional scroll overscan snapshots the adjacent row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+    t.screens.active.scroll(.{ .row = 0 });
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.beginUpdateWithOverscan(alloc, &t, 1);
+    state.endUpdate();
+
+    try testing.expectEqual(3, state.rows);
+    try testing.expectEqual(1, state.overscan_rows);
+    try testing.expectEqual(4, state.row_data.len);
+
+    const cells = state.row_data.items(.cells);
+    try testing.expectEqual('A', cells[0].get(0).raw.codepoint());
+    try testing.expectEqual('B', cells[1].get(0).raw.codepoint());
+    try testing.expectEqual('C', cells[2].get(0).raw.codepoint());
+    try testing.expectEqual('D', cells[3].get(0).raw.codepoint());
 }
 
 test "styled text" {

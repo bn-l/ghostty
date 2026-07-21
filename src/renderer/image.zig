@@ -257,6 +257,7 @@ pub const State = struct {
         alloc: Allocator,
         t: *const terminal.Terminal,
         cell_size: CellSize,
+        overscan_rows: u8,
     ) void {
         const storage = &t.screens.active.kitty_images;
         defer storage.dirty = false;
@@ -288,7 +289,13 @@ pub const State = struct {
         // The top-left and bottom-right corners of our viewport in screen
         // points. This lets us determine offsets and containment of placements.
         const top = t.screens.active.pages.getTopLeft(.viewport);
-        const bot = t.screens.active.pages.getBottomRight(.viewport).?;
+        const viewport_bot = t.screens.active.pages.getBottomRight(.viewport).?;
+        const bot = if (overscan_rows == 0)
+            viewport_bot
+        else switch (viewport_bot.downOverflow(overscan_rows)) {
+            .offset => |pin| pin,
+            .overflow => |range| range.end,
+        };
         const top_y = t.screens.active.pages.pointFromPin(.screen, top).?.screen.y;
         const bot_y = t.screens.active.pages.pointFromPin(.screen, bot).?.screen.y;
 

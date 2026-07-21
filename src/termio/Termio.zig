@@ -576,6 +576,7 @@ pub fn resize(
         defer self.renderer_state.mutex.unlock();
 
         // Update the size of our terminal state
+        self.renderer_state.resetSmoothScrollOffset();
         try self.terminal.resize(
             self.alloc,
             grid_size.columns,
@@ -726,6 +727,7 @@ pub fn scrollViewport(
 ) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+    self.renderer_state.resetSmoothScrollOffset();
     self.terminal.scrollViewport(scroll);
 }
 
@@ -734,6 +736,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+        self.renderer_state.resetSmoothScrollOffset();
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 

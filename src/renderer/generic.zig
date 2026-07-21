@@ -162,6 +162,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells goes into a separate shader.
         cells: cellpkg.Contents,
 
+        /// Visible terminal dimensions. The cell buffer can contain one extra
+        /// row while fractional scrolling is active.
+        visible_grid_size: renderer.GridSize,
+
         /// Set to true after rebuildCells is called. This can be used
         /// to determine if any possible changes have been made to the
         /// cells for the draw call.
@@ -190,6 +194,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The images that we may render.
         images: ImageState = .empty,
+        kitty_overscan_rows: u8 = 0,
 
         /// Background image, if we have one.
         bg_image: ?imagepkg.Image = null,
@@ -777,11 +782,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Render state
                 .cells = .{},
+                .visible_grid_size = options.size.grid(),
                 .uniforms = .{
                     .projection_matrix = undefined,
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .smooth_scroll_offset = 0,
+                    .smooth_scroll_overscan = 0,
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1223,6 +1231,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
+                smooth_scroll_offset: f32,
+                smooth_scroll_overscan: u8,
                 overlay_features: []const Overlay.Feature,
             };
 
@@ -1263,7 +1273,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_bottom_y = br.y;
 
                     // Scroll
+                    state.resetSmoothScrollOffset();
                     state.terminal.scrollViewport(.bottom);
+                }
+
+                if (state.smooth_scroll_overscan > 0 and
+                    self.terminal_state.screen != state.terminal.screens.active_key)
+                {
+                    state.resetSmoothScrollOffset();
                 }
 
                 // Begin the update of our terminal state. Work that
@@ -1271,9 +1288,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
-                try self.terminal_state.beginUpdate(
+                try self.terminal_state.beginUpdateWithOverscan(
                     self.alloc,
                     state.terminal,
+                    state.smooth_scroll_overscan,
                 );
 
                 // If our terminal state is dirty at all we need to redo
@@ -1302,7 +1320,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                if (self.images.kittyRequiresUpdate(state.terminal) or
+                    self.kitty_overscan_rows != state.smooth_scroll_overscan)
+                {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lock();
@@ -1314,7 +1334,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .width = self.grid_metrics.cell_width,
                             .height = self.grid_metrics.cell_height,
                         },
+                        state.smooth_scroll_overscan,
                     );
+                    self.kitty_overscan_rows = state.smooth_scroll_overscan;
                 }
 
                 // Get our OSC8 links we're hovering if we have a mouse.
@@ -1349,6 +1371,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
+                    .smooth_scroll_offset = state.smooth_scroll_offset,
+                    .smooth_scroll_overscan = state.smooth_scroll_overscan,
                     .overlay_features = overlay_features,
                 };
             };
@@ -1438,6 +1462,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
+
+                self.uniforms.smooth_scroll_offset = critical.smooth_scroll_offset;
+                self.uniforms.smooth_scroll_overscan = critical.smooth_scroll_overscan;
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -2054,8 +2081,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const blank: renderer.Padding = self.size.screen.blankPadding(
                 self.size.padding,
                 .{
-                    .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
+                    .columns = self.visible_grid_size.columns,
+                    .rows = self.visible_grid_size.rows,
                 },
                 .{
                     .width = self.grid_metrics.cell_width,
@@ -2432,22 +2459,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
-            const grid_size_diff =
-                self.cells.size.rows != state.rows or
-                self.cells.size.columns != state.cols;
+            const visible_grid_size: renderer.GridSize = .{
+                .rows = state.rows,
+                .columns = state.cols,
+            };
+            const buffer_grid_size: renderer.GridSize = .{
+                .rows = state.rows + @as(terminal.size.CellCountInt, state.overscan_rows),
+                .columns = state.cols,
+            };
+            const visible_grid_size_changed =
+                self.visible_grid_size.rows != visible_grid_size.rows or
+                self.visible_grid_size.columns != visible_grid_size.columns;
+            const buffer_needs_resize =
+                visible_grid_size_changed or
+                self.cells.size.columns != buffer_grid_size.columns or
+                self.cells.size.rows < buffer_grid_size.rows;
 
-            if (grid_size_diff) {
-                var new_size = self.cells.size;
-                new_size.rows = state.rows;
-                new_size.columns = state.cols;
-                try self.cells.resize(self.alloc, new_size);
+            if (buffer_needs_resize) {
+                var target_size = buffer_grid_size;
+                if (!visible_grid_size_changed) {
+                    // Keep the one-row capacity after a gesture. A full
+                    // rebuild clears it when overscan turns off, avoiding a
+                    // second whole-buffer allocation at gesture end.
+                    target_size.rows = @max(target_size.rows, self.cells.size.rows);
+                }
+                try self.cells.resize(self.alloc, target_size);
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
-                self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
+            self.visible_grid_size = visible_grid_size;
+            self.uniforms.grid_size = .{
+                visible_grid_size.columns,
+                visible_grid_size.rows,
+            };
 
-            const rebuild = state.dirty == .full or grid_size_diff;
+            const rebuild = state.dirty == .full or buffer_needs_resize;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2486,7 +2533,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                state.row_data.len,
                 self.cells.size.rows,
             );
 

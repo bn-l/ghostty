@@ -12,7 +12,8 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    vec2 scroll_offset = vec2(0.0, smooth_scroll_offset);
+    ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx - scroll_offset) / cell_size));
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     vec4 bg = vec4(0.0);
@@ -39,7 +40,7 @@ vec4 cell_bg() {
         } else {
             return bg;
         }
-    } else if (grid_pos.y > grid_size.y - 1) {
+    } else if (grid_pos.y > int(grid_size.y + smooth_scroll_overscan) - 1) {
         if ((padding_extend & EXTEND_DOWN) != 0) {
             grid_pos.y = int(grid_size.y) - 1;
         } else {

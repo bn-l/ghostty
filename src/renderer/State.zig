@@ -33,6 +33,14 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Fractional vertical scroll offset in pixels. Embedders can use this to
+/// move scrollback smoothly while the terminal viewport remains row based.
+smooth_scroll_offset: f32 = 0,
+
+/// Number of rows rendered beyond the integer viewport while a fractional
+/// offset exposes content at its lower edge.
+smooth_scroll_overscan: u8 = 0,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to
@@ -43,6 +51,15 @@ demand: std.atomic.Value(u32) = .init(0),
 /// `unlockDemand` after a demanding waiter releases the mutex, so that
 /// `yieldToDemand` knows the waiter had its turn.
 handoff_gen: std.atomic.Value(u32) = .init(0),
+
+pub fn resetSmoothScrollOffset(self: *State) void {
+    self.smooth_scroll_offset = 0;
+    self.smooth_scroll_overscan = 0;
+    var screens = self.terminal.screens.all.iterator();
+    while (screens.next()) |entry| {
+        entry.value.*.pages.setViewportOverscanRows(0);
+    }
+}
 
 /// How long `yieldToDemand` sleeps waiting for a demanding waiter to
 /// take its turn before giving up. This bounds how long the IO parse

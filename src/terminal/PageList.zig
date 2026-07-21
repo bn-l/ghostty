@@ -393,6 +393,10 @@ page_size: usize,
 /// in the state struct.
 page_compression: IncrementalCompressionState = .{},
 
+/// Rows immediately below the integer viewport that are required by the
+/// renderer. Compression treats pages intersecting this range as visible.
+viewport_overscan_rows: u8 = 0,
+
 /// Maximum size of the page allocation in bytes. This only includes pages
 /// that are used ONLY for scrollback. If the active area is still partially
 /// in a page that also includes scrollback, then that page is not included.
@@ -3926,6 +3930,15 @@ pub const IncrementalCompressionResult = enum {
     complete,
 };
 
+/// Keep the adjacent rows needed for fractional rendering resident alongside
+/// the viewport. Changing this invalidates incremental compression progress.
+pub fn setViewportOverscanRows(self: *PageList, rows: u8) void {
+    if (self.viewport_overscan_rows == rows) return;
+    self.viewport_overscan_rows = rows;
+    self.page_compression.markActivity();
+    self.page_compression.reset();
+}
+
 /// Iterate complete historical pages which do not intersect the viewport.
 ///
 /// All boundaries come from PageList pins and Page metadata. Advancing this
@@ -3937,11 +3950,18 @@ const CompressionIterator = struct {
     viewport_last: *List.Node,
 
     fn init(self: *const PageList) CompressionIterator {
+        const viewport_last_pin = self.getBottomRight(.viewport).?;
+        const viewport_last = if (self.viewport_overscan_rows == 0)
+            viewport_last_pin.node
+        else switch (viewport_last_pin.downOverflow(self.viewport_overscan_rows)) {
+            .offset => |viewport_pin| viewport_pin.node,
+            .overflow => |range| range.end.node,
+        };
         return .{
             .current = self.pages.first.?,
             .active = self.getTopLeft(.active).node,
             .viewport_first = self.getTopLeft(.viewport).node,
-            .viewport_last = self.getBottomRight(.viewport).?.node,
+            .viewport_last = viewport_last,
         };
     }
 
@@ -7242,6 +7262,25 @@ test "PageList full and incremental compression skip a spanning viewport" {
         try testing.expect(node.isCompressed());
     }
     try testing.expect(compressed_pages > 0);
+}
+
+test "PageList compression skips a page intersecting viewport overscan" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, 80, 24, null);
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+
+    const first = s.pages.first.?;
+    const second = first.next.?;
+    const viewport_row = first.rows() - s.rows;
+    s.scroll(.{ .row = viewport_row });
+    try testing.expectEqual(first, s.getBottomRight(.viewport).?.node);
+
+    s.setViewportOverscanRows(1);
+    _ = s.compress(.full);
+    try testing.expect(!first.isCompressed());
+    try testing.expect(!second.isCompressed());
 }
 
 test "PageList cold compression continues after an incompressible page" {
