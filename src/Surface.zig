@@ -1852,6 +1852,15 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
+    // Always use the surface's own conditional state for the termio config.
+    // When changeConditionalState returns null (no theme-conditional config
+    // rules, which is the normal case for cmux since it resolves the theme
+    // itself before handing the config to libghostty), the config's
+    // conditional_state inherits from the app level which may have a stale
+    // theme. This ensures DECRPM mode 2031 / DSR 997 reports the correct
+    // color scheme for this surface.
+    termio_config_ptr.conditional_state = self.config_conditional_state;
+
     _ = self.renderer_thread.mailbox.push(renderer_message, .{ .forever = {} });
     self.queueIo(.{
         .change_config = .{
