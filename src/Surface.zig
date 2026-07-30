@@ -710,10 +710,24 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        // Always use the surface's own conditional state for the termio
+        // config (matches the override in updateConfig). When
+        // changeConditionalState returns null (no theme-conditional config
+        // rules, the normal case for cmux since it resolves the theme itself
+        // before handing the config to libghostty), the config's own
+        // conditional_state is the default (light). Our surface state was
+        // initialized from the app state above, which the apprt keeps current
+        // via ghostty_app_set_color_scheme, and colorSchemeCallback
+        // early-returns when the schemes already match, so without this a
+        // surface created while the system is in dark mode answers DSR 996 /
+        // mode 2031 queries with light until the next theme change.
+        var termio_derived_config = try termio.Termio.DerivedConfig.init(alloc, config);
+        termio_derived_config.conditional_state = self.config_conditional_state;
+
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = termio_derived_config,
             .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
