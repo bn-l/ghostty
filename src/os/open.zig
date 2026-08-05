@@ -82,15 +82,16 @@ fn openThread(exe_: std.process.Child) void {
         var stream = stderr.readerStreaming(&buffer);
         const reader = &stream.interface;
         while (true) {
-            const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-                error.EndOfStream => break,
+            // takeDelimiter (unlike takeDelimiterExclusive) consumes the
+            // delimiter. takeDelimiterExclusive leaves the '\n' buffered, so
+            // after one complete line it returns empty slices forever and
+            // this loop spins at 100% CPU flooding the log.
+            const maybe_line = reader.takeDelimiter('\n') catch |err| switch (err) {
                 error.ReadFailed => break,
-                error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
-                    error.ReadFailed => break,
-                    error.EndOfStream => break,
-                },
+                error.StreamTooLong => reader.take(buffer.len) catch break,
             };
-            log.warn("open stderr={s}", .{line});
+            const line = maybe_line orelse break;
+            if (line.len > 0) log.warn("open stderr={s}", .{line});
         }
     }
     _ = exe.wait() catch {};
