@@ -68,10 +68,6 @@ const no_trailing_path_punctuation =
     \\(?:(?<![,.])|(?= *$))
 ;
 
-const trailing_spaces_at_eol =
-    \\(?: +(?= *$))?
-;
-
 const dotted_spaced_path_lookahead =
     \\(?=[\w\-.~:\/?#@!$&*+;=% ]*\.)
 ;
@@ -185,33 +181,28 @@ const rooted_or_relative_path_branch =
     dotted_path_space_suffix ++
     no_trailing_colon ++
     no_trailing_path_punctuation ++
-    trailing_spaces_at_eol ++
     "|" ++
     dotted_spaced_path_lookahead ++
     path_body_with_undotted_leaf ++
     malformed_spaced_path_lookahead ++
     no_trailing_colon ++
     no_trailing_path_punctuation ++
-    trailing_spaces_at_eol ++
     "|" ++
     dotted_spaced_path_lookahead ++
     path_body_with_dotted_leaf ++
     "(?:" ++ dotted_path_space_dir_suffix ++ "|" ++ dotted_path_space_single_file_segment ++ ")" ++
     no_trailing_colon ++
     no_trailing_path_punctuation ++
-    trailing_spaces_at_eol ++
     "|" ++
     dotted_path_lookahead ++
     path_chars ++ "+" ++
     no_trailing_colon ++
     no_trailing_path_punctuation ++
-    trailing_spaces_at_eol ++
     "|" ++
     non_dotted_path_lookahead ++
     path_chars ++ "+" ++
     any_path_space_segments ++
     no_trailing_colon ++
-    trailing_spaces_at_eol ++
     ")";
 
 // Branch 3: Bare relative paths such as src/config/url.zig.
@@ -223,8 +214,7 @@ const bare_relative_path_branch =
     dotted_path_lookahead ++
     bare_relative_path_prefix ++
     path_chars ++ "+" ++
-    no_trailing_colon ++
-    trailing_spaces_at_eol;
+    no_trailing_colon;
 
 pub const regex =
     scheme_url_branch ++
@@ -395,7 +385,7 @@ test "url regex" {
         },
         .{
             .input = "../example.py ",
-            .expect = "../example.py ",
+            .expect = "../example.py",
         },
         .{
             .input = "first time ../example.py contributor ",
@@ -454,11 +444,12 @@ test "url regex" {
             .input = "IPv6 in markdown [link](http://[2001:db8::1]/docs)",
             .expect = "http://[2001:db8::1]/docs",
         },
-        // File paths with spaces
+        // Trailing whitespace isn't part of a detected file path.
         .{
             .input = "./spaces-end.   ",
-            .expect = "./spaces-end.   ",
+            .expect = "./spaces-end.",
         },
+        // File paths with internal spaces
         .{
             .input = "./space middle",
             .expect = "./space middle",

@@ -1,0 +1,14 @@
+.{
+    .name = .itijah,
+    .version = "0.2.1",
+    .fingerprint = 0xae8afccd6159e191,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+        "VENDORED.md",
+    },
+}

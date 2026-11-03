@@ -15,5 +15,11 @@ pub const App = struct {
     ) !bool {
         return false;
     }
+
+    /// cmux fork: there is no app loop to wake. The fork's manual-IO termio
+    /// path processes messages inline, so a test that reaches `Surface.queueIo`
+    /// also compiles the Exec backend's path into `App.Mailbox.push`, which
+    /// calls this.
+    pub fn wakeup(_: *const App) void {}
 };
 pub const Surface = struct {};
