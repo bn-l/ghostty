@@ -3728,11 +3728,9 @@ pub fn scrollToOffset(self: *Surface, offset: f64) !void {
         self.mouse.pending_scroll_x = 0;
         self.mouse.pending_scroll_y = 0;
 
-        const cell_height: f64 = @floatFromInt(self.size.cell.height);
-        if (fractional_offset > 0 and cell_height > 0) {
-            self.renderer_state.smooth_scroll_offset = @floatCast(
-                -fractional_offset * cell_height,
-            );
+        const pixel_offset = smoothScrollPixelOffset(fractional_offset, self.size.cell.height);
+        if (pixel_offset != 0) {
+            self.renderer_state.smooth_scroll_offset = pixel_offset;
             self.renderer_state.smooth_scroll_overscan = 1;
             t.screens.active.pages.setViewportOverscanRows(1);
         } else {
@@ -3741,6 +3739,16 @@ pub fn scrollToOffset(self: *Surface, offset: f64) !void {
     }
 
     try self.queueRender();
+}
+
+/// Renderer offset for `fractional_rows` (in [0, 1)) of a cell, snapped to
+/// whole device pixels. Glyph quads move by this offset and sample a
+/// gutterless atlas with a nearest, pixel-addressed sampler: a half-pixel
+/// offset puts quad edges on pixel centres, where the GPU can round the texel
+/// row into the glyph packed above it. Flooring also keeps the offset inside
+/// the single overscan row.
+fn smoothScrollPixelOffset(fractional_rows: f64, cell_height: u32) f32 {
+    return @floatCast(-@floor(fractional_rows * @as(f64, @floatFromInt(cell_height))));
 }
 
 /// Mouse scroll event. Negative is down, left. Positive is up, right.
@@ -6545,6 +6553,38 @@ test "Surface: smooth scroll input applies inverse renderer offset" {
     try std.testing.expectEqual(@as(f64, 15), smoothScrollInputY(10, -5));
     try std.testing.expectEqual(@as(f64, 10), smoothScrollInputY(10, 0));
     try std.testing.expectEqual(@as(f64, 5), smoothScrollInputY(10, 5));
+}
+
+test "Surface: smooth scroll pixel offset lands on whole device pixels" {
+    // A sub-pixel offset makes glyphs sample the atlas row of a neighbouring
+    // glyph (see smoothScrollPixelOffset).
+    const cell_heights = [_]u32{ 0, 1, 17, 33, 35, 36, 41 };
+    for (cell_heights) |cell_height| {
+        const height: f64 = @floatFromInt(cell_height);
+        var step: u32 = 0;
+        while (step < 4096) : (step += 1) {
+            // Arrange
+            const fractional = @as(f64, @floatFromInt(step)) / 4096;
+
+            // Act
+            const offset = smoothScrollPixelOffset(fractional, cell_height);
+
+            // Assert
+            errdefer std.debug.print(
+                "cell_height={d} fractional={d} offset={d}\n",
+                .{ cell_height, fractional, offset },
+            );
+            try std.testing.expectEqual(@round(offset), offset);
+            try std.testing.expect(offset <= 0);
+            try std.testing.expect(cell_height == 0 or offset > -@as(f32, @floatCast(height)));
+            try std.testing.expect(@abs(@as(f64, offset) + fractional * height) < 1);
+        }
+    }
+
+    // The exact half-pixel position, and the top of the range, which must
+    // stay inside the single overscan row the renderer allocates.
+    try std.testing.expectEqual(@as(f32, -17), smoothScrollPixelOffset(17.5 / 35.0, 35));
+    try std.testing.expectEqual(@as(f32, -35), smoothScrollPixelOffset(1.0 - 1e-12, 36));
 }
 
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
