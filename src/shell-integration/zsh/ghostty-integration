@@ -162,17 +162,24 @@ _ghostty_deferred_init() {
                 # print the fresh-line mark for a real new prompt.
                 builtin zle || builtin print -rnu $_ghostty_fd -- $markA
 
-                # Add our marks. Since we always start from a clean PS1
-                # (either restored above or freshly set by a theme), we can
-                # unconditionally add mark1 and markB.
+                # Add our marks, but only the ones PS1 doesn't carry yet.
+                # A restored or freshly built PS1 has none. Themes that
+                # rebuild PS1 from its previous value hand our marks back:
+                # Pure keeps everything after its preprompt, including
+                # markB, and its async render leaves PS1 != marked so PS2 is
+                # not restored either. Adding marks unconditionally there
+                # grows PS1 and PS2 by one set of marks on every prompt.
                 builtin local mark2=$'%{\e]133;P;k=s\a%}'
                 builtin local markB=$'%{\e]133;B\a%}'
-                # If PS1 ends with a bare '%', it combines with the '{'
-                # in markB to form a '%{' prompt escape, swallowing the
-                # marker and producing a visible '{'. Fix by doubling the
-                # trailing '%' so it becomes a literal '%%'.
-                [[ $PS1 == *[^%]% || $PS1 == % ]] && PS1=$PS1%
-                PS1=${mark1}${PS1}${markB}
+                [[ $PS1 == *$mark1* ]] || PS1=${mark1}${PS1}
+                if [[ $PS1 != *$markB* ]]; then
+                    # If PS1 ends with a bare '%', it combines with the '{'
+                    # in markB to form a '%{' prompt escape, swallowing the
+                    # marker and producing a visible '{'. Fix by doubling the
+                    # trailing '%' so it becomes a literal '%%'.
+                    [[ $PS1 == *[^%]% || $PS1 == % ]] && PS1=$PS1%
+                    PS1=${PS1}${markB}
+                fi
 
                 # Handle multiline prompts by marking newline-separated
                 # continuation lines with k=s (mark2).
@@ -193,8 +200,11 @@ _ghostty_deferred_init() {
                 fi
 
                 # PS2 mark is needed when clearing the prompt on resize
-                [[ $PS2 == *[^%]% || $PS2 == % ]] && PS2=$PS2%
-                PS2=${mark2}${PS2}${markB}
+                [[ $PS2 == *$mark2* ]] || PS2=${mark2}${PS2}
+                if [[ $PS2 != *$markB* ]]; then
+                    [[ $PS2 == *[^%]% || $PS2 == % ]] && PS2=$PS2%
+                    PS2=${PS2}${markB}
+                fi
 
                 # Save the marked PS1 so we can detect modifications
                 # by other hooks in the next cycle.
